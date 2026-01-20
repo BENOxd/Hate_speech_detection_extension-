@@ -1,85 +1,81 @@
-// ================================
-// CONFIGURATION
-// ================================
-const API_URL = "http://127.0.0.1:5000/predict"; // Flask API endpoint
-const CHECK_INTERVAL = 3000; // Check every 3 seconds
+const API_URL = "http://127.0.0.1:5000/predict";
+const CHECK_INTERVAL = 4000;
 
-// ================================
-// HELPER: Extract visible text nodes
-// ================================
+// ===============================
+// GET TEXT ELEMENTS SAFELY
+// ===============================
 function getTextElements() {
-  const elements = document.querySelectorAll("p, span, div");
-  return Array.from(elements).filter(el => {
-    return (
-      el.innerText &&
-      el.innerText.length > 20 &&
-      !el.dataset.checked // avoid re-checking
-    );
-  });
+  return Array.from(document.querySelectorAll("p, span, div")).filter(el =>
+    el.innerText &&
+    el.innerText.length > 30 &&
+    !el.dataset.checked
+  );
 }
 
-// ================================
-// HELPER: Send text to ML API
-// ================================
-async function detectHateSpeech(text) {
+// ===============================
+// API CALL
+// ===============================
+async function detect(text) {
   try {
-    const response = await fetch(API_URL, {
+    const res = await fetch(API_URL, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ text: text })
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text })
     });
-
-    return await response.json();
-  } catch (error) {
-    console.error("API Error:", error);
+    return await res.json();
+  } catch {
     return null;
   }
 }
 
-// ================================
-// MAIN LOGIC
-// ================================
+// ===============================
+// BLUR LOGIC
+// ===============================
+function blurText(el, level) {
+  el.style.filter = `blur(${level}px)`;
+  el.style.transition = "filter 0.2s ease";
+  el.style.cursor = "pointer";
+
+  // Hover to reveal (OPTIONAL but cool)
+  el.addEventListener("mouseenter", () => {
+    el.style.filter = "blur(0px)";
+  });
+
+  el.addEventListener("mouseleave", () => {
+    el.style.filter = `blur(${level}px)`;
+  });
+}
+
+// ===============================
+// MAIN SCAN
+// ===============================
 async function scanPage() {
   const elements = getTextElements();
 
   for (let el of elements) {
-    el.dataset.checked = "true"; // mark as processed
+    el.dataset.checked = "true";
 
-    const text = el.innerText;
+    const text = el.innerText.slice(0, 300);
+    if (text.split(" ").length < 4) continue;
 
-    const result = await detectHateSpeech(text);
+    const result = await detect(text);
     if (!result) continue;
 
-    // Example API response:
-    // { label: "Hate Speech", confidence: 0.91 }
-
-    if (result.label === "Hate Speech") {
-      highlightText(el, "red", result.confidence);
-    } else if (result.label === "Offensive") {
-      highlightText(el, "orange", result.confidence);
+    // 🔴 Hate Speech → Strong blur
+    if (result.label === "Hate Speech" && result.confidence > 0.60) {
+      blurText(el, 6);
     }
+    // 🟠 Offensive → Light blur
+    else if (result.label === "Offensive" && result.confidence > 0.70) {
+      blurText(el, 3);
+    }
+    el.title = "⚠ Content blurred due to harmful language";
+
   }
 }
 
-// ================================
-// UI: Highlight detected text
-// ================================
-function highlightText(element, color, confidence) {
-  element.style.border = `2px solid ${color}`;
-  element.style.padding = "4px";
-  element.style.borderRadius = "6px";
-  element.style.backgroundColor =
-    color === "red" ? "#ffe6e6" : "#fff3e0";
-
-  element.title = `⚠ ${color.toUpperCase()} CONTENT\nConfidence: ${(confidence * 100).toFixed(1)}%`;
-}
-
-// ================================
-// REAL-TIME MONITORING
-// ================================
+// ===============================
+// REAL-TIME LOOP
+// ===============================
 setInterval(scanPage, CHECK_INTERVAL);
-
-// Initial scan
 scanPage();

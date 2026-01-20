@@ -11,9 +11,6 @@ from sklearn.metrics import classification_report, accuracy_score
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 
-# ============================
-# NLTK SETUP
-# ============================
 nltk.download("stopwords")
 nltk.download("wordnet")
 
@@ -35,13 +32,6 @@ data = pd.read_csv(
 data = data[[5, 6]]
 data.columns = ["label", "tweet"]
 
-# ============================
-# LABEL MAPPING (CRITICAL)
-# ============================
-# Original:
-# 0 = Hate
-# 1 = Offensive
-# 2 = Normal
 label_map = {
     0: 2,  # Hate -> 2
     1: 1,  # Offensive -> 1
