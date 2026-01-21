@@ -1,9 +1,5 @@
 const API_URL = "http://127.0.0.1:5000/predict";
 const CHECK_INTERVAL = 4000;
-
-// ===============================
-// GET TEXT ELEMENTS SAFELY
-// ===============================
 function getTextElements() {
   return Array.from(document.querySelectorAll("p, span, div")).filter(el =>
     el.innerText &&
@@ -12,9 +8,6 @@ function getTextElements() {
   );
 }
 
-// ===============================
-// API CALL
-// ===============================
 async function detect(text) {
   try {
     const res = await fetch(API_URL, {
@@ -28,15 +21,12 @@ async function detect(text) {
   }
 }
 
-// ===============================
-// BLUR LOGIC
-// ===============================
 function blurText(el, level) {
   el.style.filter = `blur(${level}px)`;
   el.style.transition = "filter 0.2s ease";
   el.style.cursor = "pointer";
 
-  // Hover to reveal (OPTIONAL but cool)
+  
   el.addEventListener("mouseenter", () => {
     el.style.filter = "blur(0px)";
   });
@@ -46,9 +36,7 @@ function blurText(el, level) {
   });
 }
 
-// ===============================
-// MAIN SCAN
-// ===============================
+
 async function scanPage() {
   const elements = getTextElements();
 
@@ -61,11 +49,11 @@ async function scanPage() {
     const result = await detect(text);
     if (!result) continue;
 
-    // 🔴 Hate Speech → Strong blur
+   
     if (result.label === "Hate Speech" && result.confidence > 0.60) {
       blurText(el, 6);
     }
-    // 🟠 Offensive → Light blur
+   
     else if (result.label === "Offensive" && result.confidence > 0.70) {
       blurText(el, 3);
     }

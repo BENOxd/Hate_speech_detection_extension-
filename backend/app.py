@@ -7,11 +7,9 @@ import nltk
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 
-# ==============================
-# INITIAL SETUP
-# ==============================
+
 app = Flask(__name__)
-CORS(app)  # VERY IMPORTANT for Chrome Extension
+CORS(app) 
 
 nltk.download('stopwords')
 nltk.download('wordnet')
@@ -19,23 +17,19 @@ nltk.download('wordnet')
 stop_words = set(stopwords.words('english'))
 lemmatizer = WordNetLemmatizer()
 
-# ==============================
-# LOAD MODEL & VECTORIZER
-# ==============================
+
 with open("model.pkl", "rb") as f:
     model = pickle.load(f)
 
 with open("tfidf.pkl", "rb") as f:
     vectorizer = pickle.load(f)
 
-# ==============================
-# TEXT PREPROCESSING FUNCTION
-# ==============================
+
 def preprocess_text(text):
     text = text.lower()
-    text = re.sub(r"http\S+|www\S+", "", text)  # remove URLs
-    text = re.sub(r"@\w+|#\w+", "", text)       # remove mentions & hashtags
-    text = re.sub(r"[^a-z\s]", "", text)        # remove punctuation & numbers
+    text = re.sub(r"http\S+|www\S+", "", text) 
+    text = re.sub(r"@\w+|#\w+", "", text)      
+    text = re.sub(r"[^a-z\s]", "", text)        
 
     tokens = text.split()
     tokens = [
@@ -46,9 +40,7 @@ def preprocess_text(text):
 
     return " ".join(tokens)
 
-# ==============================
-# PREDICTION API
-# ==============================
+
 @app.route("/predict", methods=["POST"])
 def predict():
     data = request.get_json()
@@ -64,7 +56,6 @@ def predict():
     prediction = model.predict(vector)[0]
     confidence = max(model.predict_proba(vector)[0])
 
-    # LABEL MAPPING (CHANGE IF NEEDED)
     label_map = {
         0: "Normal",
         1: "Offensive",
@@ -76,8 +67,5 @@ def predict():
         "confidence": round(float(confidence), 2)
     })
 
-# ==============================
-# RUN SERVER
-# ==============================
 if __name__ == "__main__":
     app.run(debug=True)
