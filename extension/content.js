@@ -5,7 +5,28 @@ const BATCH_SIZE = 20;
 const retryQueue = new Set();
 
 // ===============================
+<<<<<<< Updated upstream
 // DOM SELECTION — works on any website
+=======
+// EXTENSION CONTEXT GUARD
+// ===============================
+function isExtensionValid() {
+  try {
+    return !!chrome.runtime?.id;
+  } catch {
+    return false;
+  }
+}
+
+function handleContextInvalidated() {
+  clearInterval(scanInterval);
+  console.warn("⚠️ Extension reloaded — refreshing page to reconnect...");
+  window.location.reload();
+}
+
+// ===============================
+// DOM SELECTION
+>>>>>>> Stashed changes
 // ===============================
 function getTextElements() {
   return Array.from(document.querySelectorAll(
@@ -51,6 +72,7 @@ function getTextElements() {
 // ===============================
 // SINGLE API CALL (used for retries)
 // ===============================
+<<<<<<< Updated upstream
 async function detect(text) {
   try {
     const res = await fetch(API_URL, {
@@ -79,6 +101,62 @@ async function detectBatch(texts) {
   } catch {
     return null;
   }
+=======
+async function detectBatch(texts) {
+  if (!isExtensionValid()) { handleContextInvalidated(); return null; }
+
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage(
+        { type: "PREDICT_BATCH", texts },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            const msg = chrome.runtime.lastError.message;
+            console.error("❌ Background error:", msg);
+            if (msg.includes("Extension context invalidated")) {
+              handleContextInvalidated();
+            }
+            resolve(null);
+            return;
+          }
+          if (response?.success) resolve(response.results);
+          else resolve(null);
+        }
+      );
+    } catch (e) {
+      handleContextInvalidated();
+      resolve(null);
+    }
+  });
+}
+
+async function detect(text) {
+  if (!isExtensionValid()) { handleContextInvalidated(); return null; }
+
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage(
+        { type: "PREDICT_SINGLE", text },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            const msg = chrome.runtime.lastError.message;
+            console.error("❌ Background error:", msg);
+            if (msg.includes("Extension context invalidated")) {
+              handleContextInvalidated();
+            }
+            resolve(null);
+            return;
+          }
+          if (response?.success) resolve(response.result);
+          else resolve(null);
+        }
+      );
+    } catch (e) {
+      handleContextInvalidated();
+      resolve(null);
+    }
+  });
+>>>>>>> Stashed changes
 }
 
 // ===============================
@@ -104,7 +182,19 @@ function blurPhrasesInElement(el, spans) {
   const reversedSpans = [...spans].reverse();
 
   for (const span of reversedSpans) {
-    const blurLevel = span.label === "Hate Speech" ? 6 : 3;
+    const isHateSpeech = span.label === "Hate Speech";
+
+    const blurLevel = isHateSpeech ? 7 : 4;
+    const bgColor = isHateSpeech
+      ? "rgba(255, 50, 50, 0.35)"
+      : "rgba(255, 165, 0, 0.25)";
+    const borderColor = isHateSpeech
+      ? "rgba(255, 50, 50, 0.8)"
+      : "rgba(255, 165, 0, 0.8)";
+    const tooltipBg = isHateSpeech
+      ? "rgba(180, 0, 0, 0.9)"
+      : "rgba(180, 100, 0, 0.9)";
+    const label = isHateSpeech ? "🔴 Hate Speech" : "🟠 Offensive";
 
     for (const { node, start, end } of [...nodeMap].reverse()) {
       const overlapStart = Math.max(span.start, start);
@@ -121,22 +211,31 @@ function blurPhrasesInElement(el, spans) {
 
       const blurSpan = document.createElement("span");
       blurSpan.textContent = match;
-      blurSpan.style.filter = `blur(${blurLevel}px)`;
-      blurSpan.style.transition = "filter 0.2s ease";
-      blurSpan.style.cursor = "pointer";
-      blurSpan.style.position = "relative";
-      blurSpan.style.display = "inline-block";
+      blurSpan.style.cssText = `
+        filter: blur(${blurLevel}px);
+        transition: filter 0.2s ease, background 0.2s ease;
+        cursor: pointer;
+        position: relative;
+        display: inline-block;
+        background: ${bgColor};
+        border-radius: 3px;
+        border-bottom: 2px solid ${borderColor};
+        padding: 0 1px;
+      `;
 
+<<<<<<< Updated upstream
       // Custom tooltip element — replaces el.title
+=======
+>>>>>>> Stashed changes
       const tooltip = document.createElement("span");
-      tooltip.textContent = `⚠ ${span.label} (${Math.round(span.confidence * 100)}%). Hover to reveal.`;
+      tooltip.textContent = `${label} (${Math.round(span.confidence * 100)}%). Hover to reveal.`;
       tooltip.style.cssText = `
         display: none;
         position: absolute;
         bottom: 125%;
         left: 50%;
         transform: translateX(-50%);
-        background: rgba(0,0,0,0.8);
+        background: ${tooltipBg};
         color: #fff;
         padding: 4px 8px;
         border-radius: 4px;
@@ -144,15 +243,20 @@ function blurPhrasesInElement(el, spans) {
         white-space: nowrap;
         pointer-events: none;
         z-index: 999999;
+        font-family: sans-serif;
       `;
       blurSpan.appendChild(tooltip);
 
       blurSpan.addEventListener("mouseenter", () => {
         blurSpan.style.filter = "blur(0px)";
+        blurSpan.style.background = isHateSpeech
+          ? "rgba(255, 50, 50, 0.15)"
+          : "rgba(255, 165, 0, 0.15)";
         tooltip.style.display = "block";
       });
       blurSpan.addEventListener("mouseleave", () => {
         blurSpan.style.filter = `blur(${blurLevel}px)`;
+        blurSpan.style.background = bgColor;
         tooltip.style.display = "none";
       });
 
@@ -256,7 +360,7 @@ async function scanPage() {
 }
 
 // ===============================
-// REAL-TIME LOOP
+// REAL-TIME LOOP — stored so we can clear it on context invalidation
 // ===============================
-setInterval(scanPage, CHECK_INTERVAL);
+const scanInterval = setInterval(scanPage, CHECK_INTERVAL);
 scanPage();
