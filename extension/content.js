@@ -1,51 +1,93 @@
-const API_URL = "http://127.0.0.1:5000/predict";
 const CHECK_INTERVAL = 4000;
+const BATCH_SIZE = 20;
 const retryQueue = new Set();
 
 // ===============================
 // DOM SELECTION
 // ===============================
 function getTextElements() {
-  return Array.from(document.querySelectorAll("[data-testid='tweetText']")).filter(el => {
+  return Array.from(document.querySelectorAll(
+    "p, h1, h2, h3, li, blockquote, td, " +
+    "[data-testid='tweetText'], " +
+    "#content-text, #description, " +
+    "[data-cy='comment-body'], " +
+    ".comment-body, .usertext-body, " +
+    "article, .article-body, " +
+    "[role='article'], [role='comment'], " +
+    "[contenteditable='true']"
+  )).filter(el => {
     if (el.dataset.checked === "true") return false;
+
     const text = el.innerText?.trim();
     if (!text || text.length < 30) return false;
+
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return false;
+
+    if (el.closest("nav, header, footer, aside, script, style, noscript")) return false;
+
+    const hasBlockChildren = Array.from(el.children).some(child => {
+      const display = window.getComputedStyle(child).display;
+      return display === "block" || display === "flex" || display === "grid";
+    });
+    if (hasBlockChildren) return false;
+
     return true;
   });
 }
 
 // ===============================
-// API CALL
+// API CALLS — via background service worker
 // ===============================
+async function detectBatch(texts) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage(
+      { type: "PREDICT_BATCH", texts },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          console.error("❌ Background error:", chrome.runtime.lastError.message);
+          resolve(null);
+          return;
+        }
+        if (response?.success) resolve(response.results);
+        else resolve(null);
+      }
+    );
+  });
+}
+
 async function detect(text) {
-  try {
-    const res = await fetch(API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text })
-    });
-    return await res.json();
-  } catch {
-    return null;
-  }
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage(
+      { type: "PREDICT_SINGLE", text },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          console.error("❌ Background error:", chrome.runtime.lastError.message);
+          resolve(null);
+          return;
+        }
+        if (response?.success) resolve(response.result);
+        else resolve(null);
+      }
+    );
+  });
 }
 
 // ===============================
-// CORE FIX — walk text nodes and wrap only bad words
-// Never touches the element's structure or innerHTML
+// BLUR SPECIFIC PHRASES
 // ===============================
 function blurPhrasesInElement(el, spans) {
   if (!spans || spans.length === 0) return;
 
-  // Collect all text nodes inside this element (deep)
   const textNodes = [];
   const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
   while (walker.nextNode()) {
     textNodes.push(walker.currentNode);
   }
 
-  // Rebuild full text with offsets mapped to each text node
-  // so we know which text node a span.start/end falls in
   let offset = 0;
   const nodeMap = textNodes.map(node => {
     const start = offset;
@@ -54,20 +96,16 @@ function blurPhrasesInElement(el, spans) {
     return { node, start, end };
   });
 
-  // Process spans in reverse so DOM mutations don't shift offsets
   const reversedSpans = [...spans].reverse();
 
   for (const span of reversedSpans) {
     const blurLevel = span.label === "Hate Speech" ? 6 : 3;
 
-    // Find which text node(s) this span falls in
     for (const { node, start, end } of [...nodeMap].reverse()) {
-      // Check if this span overlaps with this text node
       const overlapStart = Math.max(span.start, start);
       const overlapEnd = Math.min(span.end, end);
       if (overlapStart >= overlapEnd) continue;
 
-      // Local offsets within this text node
       const localStart = overlapStart - start;
       const localEnd = overlapEnd - start;
 
@@ -76,22 +114,43 @@ function blurPhrasesInElement(el, spans) {
       const match = text.slice(localStart, localEnd);
       const after = text.slice(localEnd);
 
-      // Create the blurred span for just the bad word/phrase
       const blurSpan = document.createElement("span");
       blurSpan.textContent = match;
       blurSpan.style.filter = `blur(${blurLevel}px)`;
       blurSpan.style.transition = "filter 0.2s ease";
       blurSpan.style.cursor = "pointer";
-      blurSpan.title = `⚠ ${span.label} (${Math.round(span.confidence * 100)}% confidence). Hover to reveal.`;
+      blurSpan.style.position = "relative";
+      blurSpan.style.display = "inline-block";
+
+      // Custom tooltip — no native title attribute
+      const tooltip = document.createElement("span");
+      tooltip.textContent = `⚠ ${span.label} (${Math.round(span.confidence * 100)}%). Hover to reveal.`;
+      tooltip.style.cssText = `
+        display: none;
+        position: absolute;
+        bottom: 125%;
+        left: 50%;
+        transform: translateX(-50%);
+        background: rgba(0,0,0,0.8);
+        color: #fff;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 11px;
+        white-space: nowrap;
+        pointer-events: none;
+        z-index: 999999;
+      `;
+      blurSpan.appendChild(tooltip);
 
       blurSpan.addEventListener("mouseenter", () => {
         blurSpan.style.filter = "blur(0px)";
+        tooltip.style.display = "block";
       });
       blurSpan.addEventListener("mouseleave", () => {
         blurSpan.style.filter = `blur(${blurLevel}px)`;
+        tooltip.style.display = "none";
       });
 
-      // Split the text node and insert blurred span in between
       const parent = node.parentNode;
       if (!parent) continue;
 
@@ -100,50 +159,41 @@ function blurPhrasesInElement(el, spans) {
       if (before) parent.insertBefore(document.createTextNode(before), blurSpan);
 
       node.remove();
-      break; // each span targets one text node
+      break;
     }
   }
 }
 
 // ===============================
-// PROCESS SINGLE ELEMENT
+// PROCESS BATCH
 // ===============================
-async function processElement(el) {
-  const text = el.innerText.trim();
+async function processBatch(elements) {
+  const texts = elements.map(el => el.innerText.trim().slice(0, 300));
 
-  if (text.split(/\s+/).length < 4) {
-    el.dataset.checked = "true";
+  console.group(`📦 Batch Request — ${texts.length} elements`);
+  const results = await detectBatch(texts);
+
+  if (!results) {
+    console.warn("❌ Batch failed — added to retry queue");
+    console.groupEnd();
+    elements.forEach(el => retryQueue.add(el));
     return;
   }
 
-  const result = await detect(text.slice(0, 300));
-
-  if (!result) {
-    retryQueue.add(el);
-    return;
-  }
-
-  el.dataset.checked = "true";
-  retryQueue.delete(el);
-
-  // ---- DEBUG: log what API returned ----
-  console.group("🔍 Scan Result");
-  console.log("📝 Text sent:", text.slice(0, 300));
-  console.log("🏷️ Label:", result.label, "| Confidence:", result.confidence);
-  console.log("📍 Spans returned:", JSON.stringify(result.spans, null, 2));
-  if (result.spans) {
-    result.spans.forEach(s => {
-      console.log(`  → "${text.slice(s.start, s.end)}" [${s.start}-${s.end}] = ${s.label} (${s.confidence})`);
-    });
-  }
+  console.log(`✅ Batch succeeded — got ${results.length} results`);
+  results.forEach((result, i) => {
+    console.log(`  [${i}] "${texts[i].slice(0, 60)}..." → ${result.label} (${result.confidence})`);
+  });
   console.groupEnd();
-  // ---- END DEBUG ----
 
-  if (result.spans && result.spans.length > 0) {
-    blurPhrasesInElement(el, result.spans);
-  }
+  results.forEach((result, i) => {
+    const el = elements[i];
+    el.dataset.checked = "true";
+    if (result.spans && result.spans.length > 0) {
+      blurPhrasesInElement(el, result.spans);
+    }
+  });
 }
-
 
 // ===============================
 // RETRY FAILED ELEMENTS
@@ -152,8 +202,23 @@ async function retryFailed() {
   if (retryQueue.size === 0) return;
   const toRetry = Array.from(retryQueue);
   retryQueue.clear();
+
   for (const el of toRetry) {
-    if (document.contains(el)) await processElement(el);
+    if (!document.contains(el)) continue;
+    const text = el.innerText.trim();
+    if (text.split(/\s+/).length < 4) {
+      el.dataset.checked = "true";
+      continue;
+    }
+    const result = await detect(text.slice(0, 300));
+    if (!result) {
+      retryQueue.add(el);
+      continue;
+    }
+    el.dataset.checked = "true";
+    if (result.spans && result.spans.length > 0) {
+      blurPhrasesInElement(el, result.spans);
+    }
   }
 }
 
@@ -162,10 +227,19 @@ async function retryFailed() {
 // ===============================
 async function scanPage() {
   await retryFailed();
-  const elements = getTextElements();
-  for (const el of elements) {
-    await processElement(el);
+
+  const elements = getTextElements().filter(el =>
+    el.innerText.trim().split(/\s+/).length >= 4
+  );
+
+  if (elements.length === 0) return;
+
+  const batches = [];
+  for (let i = 0; i < elements.length; i += BATCH_SIZE) {
+    batches.push(elements.slice(i, i + BATCH_SIZE));
   }
+
+  await Promise.all(batches.map(batch => processBatch(batch)));
 }
 
 // ===============================
@@ -173,4 +247,3 @@ async function scanPage() {
 // ===============================
 setInterval(scanPage, CHECK_INTERVAL);
 scanPage();
-

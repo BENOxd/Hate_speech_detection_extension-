@@ -11,8 +11,8 @@ from sklearn.metrics import classification_report, accuracy_score
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 
-nltk.download("stopwords")
-nltk.download("wordnet")
+nltk.download("stopwords", quiet=True)
+nltk.download("wordnet", quiet=True)
 
 stop_words = set(stopwords.words("english"))
 lemmatizer = WordNetLemmatizer()
@@ -20,25 +20,23 @@ lemmatizer = WordNetLemmatizer()
 # ============================
 # LOAD DATASET
 # ============================
-# IMPORTANT: no header in your CSV
-data = pd.read_csv(
-    "../dataset/hate_speech_dataset.csv",
-    header=None
-)
+data = pd.read_csv("../dataset/hate_speech_dataset.csv")  # has header
 
-# Select ONLY required columns
-# Column 5 → label
-# Column 6 → tweet text
-data = data[[5, 6]]
+data = data[["class", "tweet"]]
 data.columns = ["label", "tweet"]
 
 label_map = {
-    0: 2,  # Hate -> 2
+    0: 2,  # Hate Speech -> 2
     1: 1,  # Offensive -> 1
     2: 0   # Normal -> 0
 }
 
 data["label"] = data["label"].map(label_map)
+data = data.dropna(subset=["label", "tweet"])
+data["label"] = data["label"].astype(int)
+
+print("✅ Dataset loaded:", len(data), "rows")
+print("Label distribution:\n", data["label"].value_counts())
 
 # ============================
 # TEXT PREPROCESSING
@@ -48,14 +46,8 @@ def preprocess_text(text):
     text = re.sub(r"http\S+|www\S+", "", text)
     text = re.sub(r"@\w+|#\w+", "", text)
     text = re.sub(r"[^a-z\s]", "", text)
-
     tokens = text.split()
-    tokens = [
-        lemmatizer.lemmatize(word)
-        for word in tokens
-        if word not in stop_words
-    ]
-
+    tokens = [lemmatizer.lemmatize(word) for word in tokens if word not in stop_words]
     return " ".join(tokens)
 
 data["clean_text"] = data["tweet"].apply(preprocess_text)
@@ -79,7 +71,7 @@ X_train, X_test, y_train, y_test = train_test_split(
 # ============================
 # MODEL TRAINING
 # ============================
-model = LogisticRegression(max_iter=1000)
+model = LogisticRegression(max_iter=1000, solver="lbfgs", class_weight="balanced")
 model.fit(X_train, y_train)
 
 # ============================
@@ -87,7 +79,7 @@ model.fit(X_train, y_train)
 # ============================
 y_pred = model.predict(X_test)
 
-print("Accuracy:", accuracy_score(y_test, y_pred))
+print("\nAccuracy:", accuracy_score(y_test, y_pred))
 print("\nClassification Report:\n")
 print(classification_report(y_test, y_pred))
 
