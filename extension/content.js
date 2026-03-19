@@ -1,21 +1,55 @@
 const API_URL = "http://127.0.0.1:5000/predict";
+const BATCH_API_URL = "http://127.0.0.1:5000/predict_batch";
 const CHECK_INTERVAL = 4000;
+const BATCH_SIZE = 20;
 const retryQueue = new Set();
 
 // ===============================
-// DOM SELECTION
+// DOM SELECTION — works on any website
 // ===============================
 function getTextElements() {
-  return Array.from(document.querySelectorAll("[data-testid='tweetText']")).filter(el => {
+  return Array.from(document.querySelectorAll(
+    // Generic text elements that hold readable content
+    "p, h1, h2, h3, li, blockquote, td, " +
+    // Comment/post specific across platforms
+    "[data-testid='tweetText'], " +           // X.com
+    "#content-text, #description, " +         // YouTube
+    "[data-cy='comment-body'], " +            // Reddit new
+    ".comment-body, .usertext-body, " +       // Reddit old
+    ".notion-text-block, " +                  // Notion
+    "article, .article-body, " +              // News sites
+    "[role='article'], [role='comment'], " +  // Generic ARIA
+    "[contenteditable='true']"                // Editable areas
+  )).filter(el => {
     if (el.dataset.checked === "true") return false;
+
     const text = el.innerText?.trim();
     if (!text || text.length < 30) return false;
+
+    // Skip invisible elements
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+
+    // Skip if element is off screen
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return false;
+
+    // Skip navigation, header, footer, sidebar — layout containers
+    if (el.closest("nav, header, footer, aside, script, style, noscript")) return false;
+
+    // Skip if element has block-level children — it's a container not a text holder
+    const hasBlockChildren = Array.from(el.children).some(child => {
+      const display = window.getComputedStyle(child).display;
+      return display === "block" || display === "flex" || display === "grid";
+    });
+    if (hasBlockChildren) return false;
+
     return true;
   });
 }
 
 // ===============================
-// API CALL
+// SINGLE API CALL (used for retries)
 // ===============================
 async function detect(text) {
   try {
@@ -31,21 +65,34 @@ async function detect(text) {
 }
 
 // ===============================
-// CORE FIX — walk text nodes and wrap only bad words
-// Never touches the element's structure or innerHTML
+// BATCH API CALL
+// ===============================
+async function detectBatch(texts) {
+  try {
+    const res = await fetch(BATCH_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ texts })
+    });
+    const data = await res.json();
+    return data.results;
+  } catch {
+    return null;
+  }
+}
+
+// ===============================
+// BLUR SPECIFIC PHRASES
 // ===============================
 function blurPhrasesInElement(el, spans) {
   if (!spans || spans.length === 0) return;
 
-  // Collect all text nodes inside this element (deep)
   const textNodes = [];
   const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
   while (walker.nextNode()) {
     textNodes.push(walker.currentNode);
   }
 
-  // Rebuild full text with offsets mapped to each text node
-  // so we know which text node a span.start/end falls in
   let offset = 0;
   const nodeMap = textNodes.map(node => {
     const start = offset;
@@ -54,20 +101,16 @@ function blurPhrasesInElement(el, spans) {
     return { node, start, end };
   });
 
-  // Process spans in reverse so DOM mutations don't shift offsets
   const reversedSpans = [...spans].reverse();
 
   for (const span of reversedSpans) {
     const blurLevel = span.label === "Hate Speech" ? 6 : 3;
 
-    // Find which text node(s) this span falls in
     for (const { node, start, end } of [...nodeMap].reverse()) {
-      // Check if this span overlaps with this text node
       const overlapStart = Math.max(span.start, start);
       const overlapEnd = Math.min(span.end, end);
       if (overlapStart >= overlapEnd) continue;
 
-      // Local offsets within this text node
       const localStart = overlapStart - start;
       const localEnd = overlapEnd - start;
 
@@ -76,22 +119,43 @@ function blurPhrasesInElement(el, spans) {
       const match = text.slice(localStart, localEnd);
       const after = text.slice(localEnd);
 
-      // Create the blurred span for just the bad word/phrase
       const blurSpan = document.createElement("span");
       blurSpan.textContent = match;
       blurSpan.style.filter = `blur(${blurLevel}px)`;
       blurSpan.style.transition = "filter 0.2s ease";
       blurSpan.style.cursor = "pointer";
-      blurSpan.title = `⚠ ${span.label} (${Math.round(span.confidence * 100)}% confidence). Hover to reveal.`;
+      blurSpan.style.position = "relative";
+      blurSpan.style.display = "inline-block";
+
+      // Custom tooltip element — replaces el.title
+      const tooltip = document.createElement("span");
+      tooltip.textContent = `⚠ ${span.label} (${Math.round(span.confidence * 100)}%). Hover to reveal.`;
+      tooltip.style.cssText = `
+        display: none;
+        position: absolute;
+        bottom: 125%;
+        left: 50%;
+        transform: translateX(-50%);
+        background: rgba(0,0,0,0.8);
+        color: #fff;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 11px;
+        white-space: nowrap;
+        pointer-events: none;
+        z-index: 999999;
+      `;
+      blurSpan.appendChild(tooltip);
 
       blurSpan.addEventListener("mouseenter", () => {
         blurSpan.style.filter = "blur(0px)";
+        tooltip.style.display = "block";
       });
       blurSpan.addEventListener("mouseleave", () => {
         blurSpan.style.filter = `blur(${blurLevel}px)`;
+        tooltip.style.display = "none";
       });
 
-      // Split the text node and insert blurred span in between
       const parent = node.parentNode;
       if (!parent) continue;
 
@@ -100,60 +164,73 @@ function blurPhrasesInElement(el, spans) {
       if (before) parent.insertBefore(document.createTextNode(before), blurSpan);
 
       node.remove();
-      break; // each span targets one text node
+      break;
     }
   }
 }
 
 // ===============================
-// PROCESS SINGLE ELEMENT
+// PROCESS A BATCH OF ELEMENTS
 // ===============================
-async function processElement(el) {
-  const text = el.innerText.trim();
+async function processBatch(elements) {
+  const texts = elements.map(el => el.innerText.trim().slice(0, 300));
 
-  if (text.split(/\s+/).length < 4) {
+  const results = await detectBatch(texts);
+
+  if (!results) {
+    elements.forEach(el => retryQueue.add(el));
+    return;
+  }
+
+  results.forEach((result, i) => {
+    const el = elements[i];
     el.dataset.checked = "true";
-    return;
-  }
 
-  const result = await detect(text.slice(0, 300));
+    // DEBUG
+    console.group(`📝 "${texts[i].slice(0, 80)}..."`);
+    console.log("Label:", result.label, "| Confidence:", result.confidence);
+    console.log("Spans:", JSON.stringify(result.spans));
+    if (result.spans?.length > 0) {
+      result.spans.forEach(s => {
+        const extracted = texts[i].slice(s.start, s.end);
+        console.log(`  → span [${s.start}-${s.end}] extracts: "${extracted}" | expected: "${s.phrase}"`);
+      });
+    }
+    console.groupEnd();
 
-  if (!result) {
-    retryQueue.add(el);
-    return;
-  }
-
-  el.dataset.checked = "true";
-  retryQueue.delete(el);
-
-  // ---- DEBUG: log what API returned ----
-  console.group("🔍 Scan Result");
-  console.log("📝 Text sent:", text.slice(0, 300));
-  console.log("🏷️ Label:", result.label, "| Confidence:", result.confidence);
-  console.log("📍 Spans returned:", JSON.stringify(result.spans, null, 2));
-  if (result.spans) {
-    result.spans.forEach(s => {
-      console.log(`  → "${text.slice(s.start, s.end)}" [${s.start}-${s.end}] = ${s.label} (${s.confidence})`);
-    });
-  }
-  console.groupEnd();
-  // ---- END DEBUG ----
-
-  if (result.spans && result.spans.length > 0) {
-    blurPhrasesInElement(el, result.spans);
-  }
+    if (result.spans && result.spans.length > 0) {
+      blurPhrasesInElement(el, result.spans);
+    }
+  });
 }
 
-
 // ===============================
-// RETRY FAILED ELEMENTS
+// RETRY FAILED ELEMENTS (one by one)
 // ===============================
 async function retryFailed() {
   if (retryQueue.size === 0) return;
   const toRetry = Array.from(retryQueue);
   retryQueue.clear();
+
   for (const el of toRetry) {
-    if (document.contains(el)) await processElement(el);
+    if (!document.contains(el)) continue;
+
+    const text = el.innerText.trim();
+    if (text.split(/\s+/).length < 4) {
+      el.dataset.checked = "true";
+      continue;
+    }
+
+    const result = await detect(text.slice(0, 300));
+    if (!result) {
+      retryQueue.add(el);
+      continue;
+    }
+
+    el.dataset.checked = "true";
+    if (result.spans && result.spans.length > 0) {
+      blurPhrasesInElement(el, result.spans);
+    }
   }
 }
 
@@ -162,10 +239,20 @@ async function retryFailed() {
 // ===============================
 async function scanPage() {
   await retryFailed();
-  const elements = getTextElements();
-  for (const el of elements) {
-    await processElement(el);
+
+  const elements = getTextElements().filter(el => {
+    const text = el.innerText.trim();
+    return text.split(/\s+/).length >= 4;
+  });
+
+  if (elements.length === 0) return;
+
+  const batches = [];
+  for (let i = 0; i < elements.length; i += BATCH_SIZE) {
+    batches.push(elements.slice(i, i + BATCH_SIZE));
   }
+
+  await Promise.all(batches.map(batch => processBatch(batch)));
 }
 
 // ===============================
@@ -173,4 +260,3 @@ async function scanPage() {
 // ===============================
 setInterval(scanPage, CHECK_INTERVAL);
 scanPage();
-

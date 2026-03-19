@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-from flask_cors import CORS
+
 import pickle
 import re
 import nltk
@@ -7,7 +7,7 @@ from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 
 app = Flask(__name__)
-CORS(app)
+
 
 nltk.download('stopwords', quiet=True)
 nltk.download('wordnet', quiet=True)
