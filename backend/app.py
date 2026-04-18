@@ -1,19 +1,47 @@
-from flask import Flask, request, jsonify
+import os
 import pickle
 import re
-import nltk
-from nltk.corpus import stopwords
-from nltk.stem import WordNetLemmatizer
+
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+_HF_HOME = os.path.join(_BACKEND_DIR, ".hf_home")
+os.makedirs(_HF_HOME, exist_ok=True)
+os.environ.setdefault("HF_HOME", _HF_HOME)
+
+_HF_MODEL_CACHE = os.path.join(
+    _HF_HOME,
+    "hub",
+    "models--sentence-transformers--all-MiniLM-L6-v2",
+    "snapshots",
+)
+if os.path.isdir(_HF_MODEL_CACHE) and os.listdir(_HF_MODEL_CACHE):
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+from flask import Flask, request, jsonify
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+from text_pipeline import normalize_text
 
 app = Flask(__name__)
 
-# Remove flask-cors entirely, handle manually
+ST_MODEL_NAME = "all-MiniLM-L6-v2"
+
+# Trigger offensive-keyword scan when whole text is even mildly offensive/hate.
+# Lowered from 0.55 → 0.25 so posts the model labels Normal with low confidence
+# (e.g. "this is fucking disgusting...") still get their offensive keywords blurred.
+FULL_TEXT_TRIGGER_PROB = 0.25
+# Whole-element blur fallback only when the classifier is VERY confident and no
+# keyword matched (keeps ordinary news/opinion posts from being blurred wholesale).
+FULL_TEXT_STRONG_PROB = 0.97
+
+
 @app.after_request
 def add_cors_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
     response.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
     return response
+
 
 @app.before_request
 def handle_options():
@@ -25,96 +53,175 @@ def handle_options():
         response.status_code = 200
         return response
 
-nltk.download('stopwords', quiet=True)
-nltk.download('wordnet', quiet=True)
-
-stop_words = set(stopwords.words('english'))
-lemmatizer = WordNetLemmatizer()
 
 with open("model.pkl", "rb") as f:
-    model = pickle.load(f)
+    classifier = pickle.load(f)
 
-with open("tfidf.pkl", "rb") as f:
-    vectorizer = pickle.load(f)
-
-
-def preprocess_text(text):
-    text = text.lower()
-    text = re.sub(r"http\S+|www\S+", "", text)
-    text = re.sub(r"@\w+|#\w+", "", text)
-    text = re.sub(r"[^a-z\s]", "", text)
-    tokens = text.split()
-    tokens = [lemmatizer.lemmatize(w) for w in tokens if w not in stop_words]
-    return " ".join(tokens)
+embedder = SentenceTransformer(ST_MODEL_NAME)
 
 
-def find_offensive_phrases(raw_text):
-    words = raw_text.split()
-    flagged_spans = []
-
-    for window_size in range(1, 6):
-        for i in range(len(words) - window_size + 1):
-            phrase = " ".join(words[i:i + window_size])
-            cleaned = preprocess_text(phrase)
-            if not cleaned.strip():
-                continue
-
-            vec = vectorizer.transform([cleaned])
-            pred = model.predict(vec)[0]
-            conf = max(model.predict_proba(vec)[0])
-
-            if pred in [1, 2] and conf > 0.75:
-                start = raw_text.lower().find(phrase.lower())
-                if start != -1:
-                    flagged_spans.append({
-                        "phrase": phrase,
-                        "start": start,
-                        "end": start + len(phrase),
-                        "label": "Hate Speech" if pred == 2 else "Offensive",
-                        "confidence": round(float(conf), 2)
-                    })
-
-    if not flagged_spans:
+def _load_wordlist(filename):
+    path = os.path.join(_BACKEND_DIR, filename)
+    if not os.path.exists(path):
         return []
+    words = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            w = line.strip().lower()
+            if not w or w.startswith("#"):
+                continue
+            words.append(w)
+    return sorted(set(words), key=len, reverse=True)
 
-    flagged_spans.sort(key=lambda x: x["start"])
-    merged = [flagged_spans[0]]
 
-    for current in flagged_spans[1:]:
-        last = merged[-1]
-        if current["start"] <= last["end"]:
-            merged[-1]["end"] = max(last["end"], current["end"])
-            merged[-1]["phrase"] = raw_text[merged[-1]["start"]:merged[-1]["end"]]
-            if current["label"] == "Hate Speech":
-                merged[-1]["label"] = "Hate Speech"
-                merged[-1]["confidence"] = current["confidence"]
-        else:
-            merged.append(current)
+def _compile_wordlist_regex(words):
+    if not words:
+        return None
+    escaped = [re.escape(w) for w in words]
+    pattern = r"(?<![A-Za-z0-9_])(?:" + "|".join(escaped) + r")(?![A-Za-z0-9_])"
+    return re.compile(pattern, re.IGNORECASE)
 
+
+_OFFENSIVE_WORDS = _load_wordlist("words_offensive.txt")
+_HATE_WORDS = _load_wordlist("words_hate.txt")
+_OFFENSIVE_RE = _compile_wordlist_regex(_OFFENSIVE_WORDS)
+_HATE_RE = _compile_wordlist_regex(_HATE_WORDS)
+
+
+def embed_texts(texts, batch_size=64):
+    if not texts:
+        return np.zeros((0, embedder.get_sentence_embedding_dimension()), dtype=np.float32)
+    return embedder.encode(
+        texts,
+        batch_size=batch_size,
+        show_progress_bar=False,
+        convert_to_numpy=True,
+    )
+
+
+def predict_proba_batch(texts):
+    emb = embed_texts(texts)
+    return classifier.predict_proba(emb)
+
+
+def _scan_pattern(pattern, raw_text, label, confidence):
+    if pattern is None:
+        return []
+    spans = []
+    for m in pattern.finditer(raw_text):
+        spans.append(
+            {
+                "phrase": raw_text[m.start() : m.end()],
+                "start": m.start(),
+                "end": m.end(),
+                "label": label,
+                "confidence": round(confidence, 2),
+            }
+        )
+    return spans
+
+
+def _merge_spans(spans):
+    if not spans:
+        return []
+    spans.sort(key=lambda s: (s["start"], 0 if s["label"] == "Hate Speech" else 1))
+    merged = []
+    for span in spans:
+        if merged and span["start"] < merged[-1]["end"]:
+            if span["label"] == "Hate Speech" and merged[-1]["label"] != "Hate Speech":
+                merged[-1] = span
+            continue
+        merged.append(span)
     return merged
 
 
-def process_single(raw_text):
-    cleaned_text = preprocess_text(raw_text)
+_SENTENCE_BOUNDARY_RE = re.compile(r"[.!?]+\s+|\n+")
 
-    if not cleaned_text.strip():
+
+def _sentence_ranges(text):
+    ranges = []
+    pos = 0
+    for m in _SENTENCE_BOUNDARY_RE.finditer(text):
+        ranges.append((pos, m.end()))
+        pos = m.end()
+    if pos < len(text):
+        ranges.append((pos, len(text)))
+    return ranges or [(0, len(text))]
+
+
+def _escalate_offensive_in_hate_sentences(spans, raw_text):
+    """
+    If a sentence already contains a Hate Speech span, any Offensive spans
+    inside the same sentence are treated as Hate Speech (intent is the same).
+    """
+    if not spans:
+        return spans
+    for s_start, s_end in _sentence_ranges(raw_text):
+        in_sentence = [sp for sp in spans if sp["start"] >= s_start and sp["end"] <= s_end]
+        if not in_sentence:
+            continue
+        if any(sp["label"] == "Hate Speech" for sp in in_sentence):
+            for sp in in_sentence:
+                if sp["label"] == "Offensive":
+                    sp["label"] = "Hate Speech"
+                    sp["confidence"] = max(sp["confidence"], 0.9)
+    return spans
+
+
+def find_keyword_spans(raw_text, confidence, include_offensive):
+    """
+    Hate-word matches always run (context-independent slurs).
+    Offensive-word matches are gated on include_offensive (ML said text is offensive).
+    If a sentence contains a Hate match, co-located Offensive matches are
+    escalated to Hate Speech (same intent).
+    """
+    spans = _scan_pattern(_HATE_RE, raw_text, "Hate Speech", max(confidence, 0.9))
+    if include_offensive:
+        spans.extend(_scan_pattern(_OFFENSIVE_RE, raw_text, "Offensive", confidence))
+    spans = _merge_spans(spans)
+    spans = _escalate_offensive_in_hate_sentences(spans, raw_text)
+    return spans
+
+
+def process_single(raw_text):
+    cleaned = normalize_text(raw_text)
+    if not cleaned.strip():
         return {"label": "Normal", "confidence": 1.0, "spans": []}
 
-    vector = vectorizer.transform([cleaned_text])
-    prediction = model.predict(vector)[0]
-    confidence = max(model.predict_proba(vector)[0])
+    probs = predict_proba_batch([cleaned])[0]
+    prediction = int(np.argmax(probs))
+    confidence = float(np.max(probs))
 
     label_map = {0: "Normal", 1: "Offensive", 2: "Hate Speech"}
     label = label_map[prediction]
 
-    spans = []
-    if prediction in [1, 2]:
-        spans = find_offensive_phrases(raw_text)
+    non_normal_prob = float(probs[1] + probs[2])
+    include_offensive = non_normal_prob >= FULL_TEXT_TRIGGER_PROB
+
+    spans = find_keyword_spans(raw_text, confidence, include_offensive)
+
+    if (
+        not spans
+        and include_offensive
+        and non_normal_prob >= FULL_TEXT_STRONG_PROB
+    ):
+        spans = [
+            {
+                "phrase": raw_text,
+                "start": 0,
+                "end": len(raw_text),
+                "label": label,
+                "confidence": round(confidence, 2),
+            }
+        ]
+
+    if spans and label == "Normal":
+        label = "Hate Speech" if any(s["label"] == "Hate Speech" for s in spans) else "Offensive"
 
     return {
         "label": label,
-        "confidence": round(float(confidence), 2),
-        "spans": spans
+        "confidence": round(confidence, 2),
+        "spans": spans,
     }
 
 
